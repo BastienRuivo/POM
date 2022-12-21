@@ -12,7 +12,6 @@ include_directories(include)
 
 set(SRCS
     ./src/SnippetPBDCloth.cpp
-    ./src/SnippetPBDClothRender.cpp
 )
 
 set(outputName run)

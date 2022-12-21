@@ -31,6 +31,20 @@
 // particle simulation. It creates a piece of cloth that drops onto a rotating
 // sphere. 
 // ****************************************************************************
+#include <vector>
+#include <iostream>
+
+#include "PxPhysicsAPI.h"
+#include "cudamanager/PxCudaContext.h"
+#include "cudamanager/PxCudaContextManager.h"
+
+#include "snippetrender/SnippetRender.h"
+#include "snippetrender/SnippetCamera.h"
+
+#define CUDA_SUCCESS 0
+#define SHOW_SOLID_SDF_SLICE 0
+#define IDX(i, j, k, offset) ((i) + dimX * ((j) + dimY * ((k) + dimZ * (offset))))
+
 
 #include <ctype.h>
 #include "PxPhysicsAPI.h"
@@ -42,6 +56,160 @@
 using namespace physx;
 using namespace ExtGpu;
 
+extern void initPhysics(bool interactive);
+extern void stepPhysics(bool interactive);	
+extern void cleanupPhysics(bool interactive);
+extern void keyPress(unsigned char key, const PxTransform& camera);
+extern PxPBDParticleSystem* getParticleSystem();
+extern PxParticleClothBuffer* getUserClothBuffer();
+
+namespace
+{
+Snippets::Camera* sCamera;
+
+Snippets::SharedGLBuffer sPosBuffer;
+PxU32 nbTriangle;
+PxU32 nbParts;
+PxVec4 * array;
+PxU32 * ind;
+
+unsigned int EBO;
+
+
+void onBeforeRenderParticles()
+{
+	PxPBDParticleSystem* particleSystem = getParticleSystem();
+	if (particleSystem) 
+	{
+		PxParticleClothBuffer* userBuffer = getUserClothBuffer();
+		PxVec4* positions = userBuffer->getPositionInvMasses();
+		PxU32* indexes = userBuffer->getTriangles();
+		const PxU32 numParticles = userBuffer->getNbActiveParticles();
+		nbParts = numParticles;
+
+		PxScene* scene;
+		PxGetPhysics().getScenes(&scene, 1);
+		PxCudaContextManager* cudaContexManager = scene->getCudaContextManager();
+		
+
+		cudaContexManager->acquireContext();
+		PxCudaContext* cudaContext = cudaContexManager->getCudaContext();
+		array = new PxVec4[numParticles];
+		ind = new PxU32[nbTriangle * 3];
+
+		cudaContext->memcpyDtoH(sPosBuffer.map(), CUdeviceptr(positions), sizeof(PxVec4) * numParticles);
+		cudaContext->memcpyDtoH(array, CUdeviceptr(positions), sizeof(PxVec4) * numParticles);
+		cudaContext->memcpyDtoH(ind, CUdeviceptr(indexes), sizeof(PxU32) * nbTriangle * 3);
+
+
+		
+
+
+		cudaContexManager->releaseContext();
+#if SHOW_SOLID_SDF_SLICE
+		particleSystem->copySparseGridData(sSparseGridSolidSDFBufferD, PxSparseGridDataFlag::eGRIDCELL_SOLID_GRADIENT_AND_SDF);
+#endif
+	}
+	
+}
+
+
+
+void renderParticles()
+{
+	
+	sPosBuffer.unmap();
+	
+	PxVec3 color(1.f, 1.f, 1.f);
+	
+	Snippets::renderMesh(nbParts, array, nbTriangle, ind, PxVec3(1.0f, 1.f, 1.f));
+
+	
+	//Snippets::DrawPoints(sPosBuffer.vbo, sPosBuffer.size / sizeof(PxVec4), {1.f, 0.f, 0.f}, 2.f);
+	Snippets::DrawFrame(PxVec3(0, 0, 0));
+}
+
+
+
+void allocParticleBuffers()
+{
+	PxScene* scene;
+	PxGetPhysics().getScenes(&scene, 1);
+	PxCudaContextManager* cudaContexManager = scene->getCudaContextManager();
+
+	PxParticleClothBuffer* userBuffer = getUserClothBuffer();
+	PxU32 maxParticles = userBuffer->getMaxParticles();
+
+	sPosBuffer.initialize(cudaContexManager);
+	sPosBuffer.allocate(maxParticles * sizeof(PxVec4));
+}
+
+void clearupParticleBuffers()
+{
+	sPosBuffer.release();
+}
+
+void renderCallback()
+{
+	onBeforeRenderParticles();
+
+	stepPhysics(true);
+
+
+	Snippets::startRender(sCamera);
+
+	glDisable(GL_CULL_FACE); 
+	PxScene* scene;
+	PxGetPhysics().getScenes(&scene,1);
+	PxU32 nbActors = scene->getNbActors(PxActorTypeFlag::eRIGID_DYNAMIC | PxActorTypeFlag::eRIGID_STATIC);
+	if(nbActors)
+	{
+		std::vector<PxRigidActor*> actors(nbActors);
+		scene->getActors(PxActorTypeFlag::eRIGID_DYNAMIC | PxActorTypeFlag::eRIGID_STATIC, reinterpret_cast<PxActor**>(&actors[0]), nbActors);
+		Snippets::renderActors(&actors[0], static_cast<PxU32>(actors.size()), true, PxVec3(1.f, 0.f, 0.f), NULL, true, false);
+	}
+	
+	
+	renderParticles();
+
+	Snippets::showFPS();
+
+	Snippets::finishRender();
+}
+
+void cleanup()
+{
+	delete sCamera;
+	clearupParticleBuffers();
+	cleanupPhysics(true);
+}
+
+void exitCallback(void)
+{
+#if PX_WINDOWS
+	cleanup();
+#endif
+}
+}
+
+void renderLoop()
+{
+	sCamera = new Snippets::Camera(PxVec3(15.0f, 10.0f, 15.0f), PxVec3(-0.6f,-0.2f,-0.6f));
+
+	Snippets::setupDefault("PhysX Snippet PBDCloth", sCamera, keyPress, renderCallback, exitCallback);
+
+	initPhysics(true);
+    glGenBuffers(1, &EBO);
+
+	allocParticleBuffers();
+
+	glutMainLoop();
+
+#if PX_LINUX_FAMILY
+	cleanup();
+#endif
+}
+
 static PxDefaultAllocator			gAllocator;
 static PxDefaultErrorCallback		gErrorCallback;
 static PxFoundation*				gFoundation			= NULL;
@@ -52,6 +220,7 @@ static PxMaterial*					gMaterial			= NULL;
 static PxPvd*						gPvd				= NULL;
 static PxPBDParticleSystem*			gParticleSystem		= NULL;
 static PxParticleClothBuffer*		gClothBuffer		= NULL;
+static ExtGpu::PxParticleAttachmentBuffer *		gAttachementBuffer		= NULL;
 static bool							gIsRunning			= true;
 
 PxRigidDynamic* sphere;
@@ -59,12 +228,14 @@ PxRigidDynamic* sphere;
 static void initObstacles()
 {
 	PxShape* shape = gPhysics->createShape(PxSphereGeometry(3.0f), *gMaterial);
-	sphere = gPhysics->createRigidDynamic(PxTransform(PxVec3(0.f, 5.0f, 0.f)));
-	sphere->attachShape(*shape);
-	sphere->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-	gScene->addActor(*sphere);
+	// sphere = gPhysics->createRigidDynamic(PxTransform(PxVec3(0.f, 5.0f, 0.f)));
+	// sphere->attachShape(*shape);
+	// sphere->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+	// gScene->addActor(*sphere);
 	shape->release();
 }
+
+
 
 // -----------------------------------------------------------------------------------------------------------------
 static void initScene()
@@ -106,7 +277,7 @@ static PX_FORCE_INLINE PxU32 id(PxU32 x, PxU32 y, PxU32 numY)
 	return x * numY + y;
 }
 
-static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position = PxVec3(0, 0, 0), const PxReal particleSpacing = 0.2f, const PxReal totalClothMass = 10.f)
+static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position = PxVec3(0, 10, 0), const PxReal particleSpacing = 0.2f, const PxReal totalClothMass = 10.f, PxRigidActor* toAttach = nullptr)
 {
 	PxCudaContextManager* cudaContextManager = gScene->getCudaContextManager();
 	if (cudaContextManager == NULL)
@@ -141,7 +312,6 @@ static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position
 
 	// Create particles and add them to the particle system
 	const PxU32 particlePhase = particleSystem->createPhase(defaultMat, PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollideFilter | PxParticlePhaseFlag::eParticlePhaseSelfCollide));
-
 	PxParticleClothBufferHelper* clothBuffers = PxCreateParticleClothBufferHelper(1, numTriangles, numSprings, numParticles, cudaContextManager);
 
 	PxU32* phase = cudaContextManager->allocPinnedHostBuffer<PxU32>(numParticles);
@@ -151,8 +321,10 @@ static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position
 	PxReal x = position.x;
 	PxReal y = position.y;
 	PxReal z = position.z;
+	std::cout<<position.z << " z = " << z<<std::endl;
 
 	// Define springs and triangles
+	
 	PxArray<PxParticleSpring> springs;
 	springs.reserve(numSprings);
 	PxArray<PxU32> triangles;
@@ -162,12 +334,13 @@ static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position
 	{
 		for (PxU32 j = 0; j < numZ; ++j)
 		{
+			
 			const PxU32 index = i * numZ + j;
 
 			PxVec4 pos(x, y, z, 1.0f / particleMass);
 			phase[index] = particlePhase;
 			positionInvMass[index] = pos;
-			velocity[index] = PxVec4(0.0f);
+			velocity[index] = PxVec4(0.f, 0.f, 0.f, 0.f);
 				
 			if (i > 0)
 			{
@@ -193,21 +366,22 @@ static void initCloth(const PxU32 numX, const PxU32 numZ, const PxVec3& position
 				triangles.pushBack(id(i, j - 1, numZ));
 
 				triangles.pushBack(id(i - 1, j, numZ));
-				triangles.pushBack(id(i, j - 1, numZ));
 				triangles.pushBack(id(i, j, numZ));
+				triangles.pushBack(id(i, j - 1, numZ));
 			}
 
-			z += particleSpacing;
+			y += particleSpacing;
 		}
-		z = position.z;
+		y = position.y;
 		x += particleSpacing;
 	}
 
 	PX_ASSERT(numSprings == springs.size());
 	PX_ASSERT(numTriangles == triangles.size()/3);
+	nbTriangle = numTriangles;
 	
 	clothBuffers->addCloth(0.0f, 0.0f, 0.0f, triangles.begin(), numTriangles, springs.begin(), numSprings, positionInvMass, numParticles);
-
+	gParticleSystem->addRigidAttachment(toAttach);
 	ExtGpu::PxParticleBufferDesc bufferDesc;
 	bufferDesc.maxParticles = numParticles;
 	bufferDesc.numActiveParticles = numParticles;
@@ -264,30 +438,34 @@ void initPhysics(bool /*interactive*/)
 	}
 	gMaterial = gPhysics->createMaterial(0.5f, 0.5f, 0.6f);
 
+	// Setup rigid bodies
+	const PxReal boxSize = 1.0f;
+	const PxReal boxMass = 1.0f;
+	float thickness = 0.01f;
+	PxShape* shape = gPhysics->createShape(PxBoxGeometry(thickness * boxSize, 5.f * boxSize, thickness * boxSize), *gMaterial);
+	PxRigidStatic* body = gPhysics->createRigidStatic(PxTransform(PxVec3(-thickness/2, 5.0f, -thickness/2)));
+	body->attachShape(*shape);
+	
+	
+	gScene->addActor(*body);
+
 	// Setup Cloth
 	const PxReal totalClothMass = 10.0f;
 
-	PxU32 numPointsX = 250;
-	PxU32 numPointsZ = 250;
+	PxU32 numPointsX = 150;
+	PxU32 numPointsZ = 100;
 	PxReal particleSpacing = 0.05f;
-	initCloth(numPointsX, numPointsZ, PxVec3(-0.5f*numPointsX*particleSpacing, 8.f, -0.5f*numPointsZ*particleSpacing), particleSpacing, totalClothMass);
+	initCloth(numPointsX, numPointsZ, PxVec3(0.f, 5.f, 0.f), particleSpacing, totalClothMass, body);
+	
+
 
 	initObstacles();
 
 	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 1.f, 0.f, 0.0f), *gMaterial));
 	
+	//gParticleSystem.add
+	//gParticleSystem->setWind(PxVec3(0, 0, 0));
 
-	// Setup rigid bodies
-	const PxReal boxSize = 1.0f;
-	const PxReal boxMass = 1.0f;
-	PxShape* shape = gPhysics->createShape(PxBoxGeometry(0.5f * boxSize, 0.5f * boxSize, 0.5f * boxSize), *gMaterial);
-	for (int i = 0; i < 5; ++i)
-	{
-		PxRigidDynamic* body = gPhysics->createRigidDynamic(PxTransform(PxVec3(i - 3.0f, 10, 4.0f)));
-		body->attachShape(*shape);
-		PxRigidBodyExt::updateMassAndInertia(*body, boxMass);
-		gScene->addActor(*body);
-	}
 	shape->release();
 }
 
@@ -299,13 +477,13 @@ void stepPhysics(bool /*interactive*/)
 	{
 		const PxReal dt = 1.0f / 60.0f;
 
-		bool rotatingSphere = true;
-		if (rotatingSphere)
-		{
-			const PxReal speed = 2.0f;
-			PxTransform pose = sphere->getGlobalPose();			
-			sphere->setKinematicTarget(PxTransform(pose.p, PxQuat(PxCos(simTime*speed), PxVec3(0,1,0))));
-		}
+		// bool rotatingSphere = false;
+		// if (rotatingSphere)
+		// {
+		// 	const PxReal speed = 2.0f;
+		// 	PxTransform pose = sphere->getGlobalPose();			
+		// 	sphere->setKinematicTarget(PxTransform(pose.p, PxQuat(PxCos(simTime*speed), PxVec3(0,1,0))));
+		// }
 
 		gScene->simulate(dt);
 		gScene->fetchResults(true);
@@ -342,16 +520,7 @@ void keyPress(unsigned char key, const PxTransform& camera)
 
 int main(int, const char*const*)
 {
-#ifdef RENDER_SNIPPET
-	extern void renderLoop();
 	renderLoop();
-#else
-	static const PxU32 frameCount = 100;
-	initPhysics(false);
-	for(PxU32 i=0; i<frameCount; i++)
-		stepPhysics(false);
-	cleanupPhysics(false);
-#endif
 
 	return 0;
 }
